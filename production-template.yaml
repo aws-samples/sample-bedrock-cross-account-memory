@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cross-Account Bedrock Agent Memory Sharing Solution'
+
+Parameters:
+  SupervisorAgentId:
+    Type: String
+    Description: Bedrock Agent ID in supervisor account
+  WorkerAgentId:
+    Type: String
+    Description: Bedrock Agent ID in worker account
+  WorkerAccountId:
+    Type: String
+    Description: AWS Account ID where worker agent is deployed
+
+Resources:
+  CrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockCrossAccountAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeAgent
+                Resource: '*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::${WorkerAccountId}:role/CrossAccountBedrockRole'
+
+  CrossAccountOrchestrator:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt CrossAccountRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SUPERVISOR_AGENT_ID: !Ref SupervisorAgentId
+          WORKER_AGENT_ID: !Ref WorkerAgentId
+          WORKER_ACCOUNT_ID: !Ref WorkerAccountId
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import random
+          
+          def handler(event, context):
+              supervisor_agent = os.environ['SUPERVISOR_AGENT_ID']
+              worker_agent = os.environ['WORKER_AGENT_ID']
+              worker_account = os.environ['WORKER_ACCOUNT_ID']
+              
+              user_input = event.get('user_input', '')
+              session_id = f"session-{random.randint(1000,9999)}-{context.aws_request_id[:8]}"
+              
+              try:
+                  # Call supervisor in current account
+                  bedrock = boto3.client('bedrock-agent-runtime')
+                  supervisor_response = bedrock.invoke_agent(
+                      agentId=supervisor_agent,
+                      agentAliasId='TSTALIASID',
+                      sessionId=session_id,
+                      inputText=user_input
+                  )
+                  
+                  supervisor_text = ''.join([
+                      event['chunk']['bytes'].decode('utf-8')
+                      for event in supervisor_response['completion']
+                      if 'chunk' in event and 'bytes' in event['chunk']
+                  ])
+                  
+                  # Call worker in target account
+                  sts = boto3.client('sts')
+                  assumed_role = sts.assume_role(
+                      RoleArn=f'arn:aws:iam::{worker_account}:role/CrossAccountBedrockRole',
+                      RoleSessionName='cross-account-bedrock'
+                  )
+                  
+                  worker_bedrock = boto3.client(
+                      'bedrock-agent-runtime',
+                      aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
+                      aws_session_token=assumed_role['Credentials']['SessionToken']
+                  )
+                  
+                  worker_input = f"CONTEXT: User asked '{user_input}'. Supervisor responded: '{supervisor_text}'\n\nBased on this conversation, provide helpful advice."
+                  
+                  worker_response = worker_bedrock.invoke_agent(
+                      agentId=worker_agent,
+                      agentAliasId='TSTALIASID',
+                      sessionId=f"{session_id}-worker",
+                      inputText=worker_input
+                  )
+                  
+                  worker_text = ''.join([
+                      event['chunk']['bytes'].decode('utf-8')
+                      for event in worker_response['completion']
+                      if 'chunk' in event and 'bytes' in event['chunk']
+                  ])
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          "supervisor_response": supervisor_text,
+                          "worker_response": worker_text,
+                          "delegation": True
+                      })
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          "error": str(e),
+                          "supervisor_response": None,
+                          "worker_response": None,
+                          "delegation": False
+                      })
+                  }
+
+Outputs:
+  OrchestratorFunction:
+    Description: Lambda function for cross-account orchestration
+    Value: !Ref CrossAccountOrchestrator
+    Export:
+      Name: !Sub "${AWS::StackName}-OrchestratorFunction"
