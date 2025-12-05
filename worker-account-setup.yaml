@@ -1,0 +1,35 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Worker Account IAM Role for Cross-Account Bedrock Access'
+
+Parameters:
+  SupervisorAccountId:
+    Type: String
+    Description: AWS Account ID of the supervisor account
+
+Resources:
+  CrossAccountBedrockRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CrossAccountBedrockRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${SupervisorAccountId}:role/CrossAccountRole'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAgentAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeAgent
+                Resource: '*'
+
+Outputs:
+  CrossAccountRoleArn:
+    Description: ARN of the cross-account role
+    Value: !GetAtt CrossAccountBedrockRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CrossAccountRoleArn"
